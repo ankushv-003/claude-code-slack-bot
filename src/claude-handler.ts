@@ -1,7 +1,10 @@
-import { query, type SDKMessage } from '@anthropic-ai/claude-code';
-import { ConversationSession } from './types';
+import { spawn } from 'child_process';
+import { createInterface } from 'readline';
+import { join, resolve } from 'path';
+import { ConversationSession, SDKMessage } from './types';
 import { Logger } from './logger';
-import { McpManager, McpServerConfig } from './mcp-manager';
+import { McpManager } from './mcp-manager';
+import { config } from './config';
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
@@ -39,94 +42,146 @@ export class ClaudeHandler {
     workingDirectory?: string,
     slackContext?: { channel: string; threadTs?: string; user: string }
   ): AsyncGenerator<SDKMessage, void, unknown> {
-    const options: any = {
-      outputFormat: 'stream-json',
-      permissionMode: slackContext ? 'default' : 'bypassPermissions',
-    };
+    const ctrl = abortController || new AbortController();
 
-    // Add permission prompt tool if we have Slack context
+    // Build CLI args
+    const args: string[] = ['--output-format', 'stream-json', '--verbose'];
+
+    if (config.claude.model) {
+      args.push('--model', config.claude.model);
+    }
+
+    // bypassPermissions when no Slack context (e.g. direct API use)
+    if (!slackContext) {
+      args.push('--permission-mode', 'bypassPermissions');
+    }
+
     if (slackContext) {
-      options.permissionPromptToolName = 'mcp__permission-prompt__permission_prompt';
-      this.logger.debug('Added permission prompt tool for Slack integration', slackContext);
+      args.push('--permission-prompt-tool', 'mcp__permission-prompt__permission_prompt');
     }
 
-    if (workingDirectory) {
-      options.cwd = workingDirectory;
-    }
-
-    // Add MCP server configuration if available
+    // MCP servers
     const mcpServers = this.mcpManager.getServerConfiguration();
-    
-    // Add permission prompt server if we have Slack context
+    const allMcpServers: Record<string, any> = mcpServers ? { ...mcpServers } : {};
+
     if (slackContext) {
-      const permissionServer = {
-        'permission-prompt': {
-          command: 'npx',
-          args: ['tsx', '/Users/marcelpociot/Experiments/claude-code-slack/src/permission-mcp-server.ts'],
-          env: {
-            SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_CONTEXT: JSON.stringify(slackContext)
-          }
-        }
+      const scriptPath = resolve(process.cwd(), 'src', 'permission-mcp-server.ts');
+      allMcpServers['permission-prompt'] = {
+        command: 'npx',
+        args: ['tsx', scriptPath],
+        env: {
+          SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
+          SLACK_CONTEXT: JSON.stringify(slackContext),
+        },
       };
-      
-      if (mcpServers) {
-        options.mcpServers = { ...mcpServers, ...permissionServer };
-      } else {
-        options.mcpServers = permissionServer;
-      }
-    } else if (mcpServers && Object.keys(mcpServers).length > 0) {
-      options.mcpServers = mcpServers;
     }
-    
-    if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
-      // Allow all MCP tools by default, plus permission prompt tool
+
+    if (Object.keys(allMcpServers).length > 0) {
+      args.push('--mcp-config', JSON.stringify({ mcpServers: allMcpServers }));
+
       const defaultMcpTools = this.mcpManager.getDefaultAllowedTools();
       if (slackContext) {
         defaultMcpTools.push('mcp__permission-prompt');
       }
       if (defaultMcpTools.length > 0) {
-        options.allowedTools = defaultMcpTools;
+        args.push('--allowedTools', defaultMcpTools.join(','));
       }
-      
-      this.logger.debug('Added MCP configuration to options', {
-        serverCount: Object.keys(options.mcpServers).length,
-        servers: Object.keys(options.mcpServers),
-        allowedTools: defaultMcpTools,
-        hasSlackContext: !!slackContext,
-      });
     }
 
     if (session?.sessionId) {
-      options.resume = session.sessionId;
+      args.push('--resume', session.sessionId);
       this.logger.debug('Resuming session', { sessionId: session.sessionId });
     } else {
       this.logger.debug('Starting new Claude conversation');
     }
 
-    this.logger.debug('Claude query options', options);
+    args.push('--print', prompt.trim());
+
+    // Resolve CLI path
+    let cliPath: string;
+    try {
+      cliPath = require.resolve('@anthropic-ai/claude-code/cli.js');
+    } catch {
+      cliPath = join(process.cwd(), 'node_modules/@anthropic-ai/claude-code/cli.js');
+    }
+
+    this.logger.debug('Spawning Claude CLI', {
+      cliPath,
+      model: config.claude.model,
+      workingDirectory,
+      hasSlackContext: !!slackContext,
+      mcpServerCount: Object.keys(allMcpServers).length,
+    });
+
+    const child = spawn('node', [cliPath, ...args], {
+      cwd: workingDirectory,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      signal: ctrl.signal,
+      env: { ...process.env },
+    });
+
+    child.stdin.end();
+
+    if (process.env.DEBUG) {
+      child.stderr.on('data', (data: Buffer) => {
+        this.logger.debug('Claude CLI stderr', data.toString());
+      });
+    }
+
+    const cleanup = () => {
+      if (!child.killed) child.kill('SIGTERM');
+    };
+    ctrl.signal.addEventListener('abort', cleanup);
 
     try {
-      for await (const message of query({
-        prompt,
-        abortController: abortController || new AbortController(),
-        options,
-      })) {
-        if (message.type === 'system' && message.subtype === 'init') {
-          if (session) {
-            session.sessionId = message.session_id;
-            this.logger.info('Session initialized', { 
-              sessionId: message.session_id,
-              model: (message as any).model,
-              tools: (message as any).tools?.length || 0,
-            });
+      let processError: Error | null = null;
+      child.on('error', (err: Error) => {
+        processError = new Error(`Failed to spawn Claude CLI: ${err.message}`);
+      });
+
+      const processExitPromise = new Promise<void>((res, rej) => {
+        child.on('close', (code: number | null) => {
+          if (ctrl.signal.aborted) {
+            rej(Object.assign(new Error('Claude CLI aborted'), { name: 'AbortError' }));
+            return;
           }
+          if (code !== 0) {
+            rej(new Error(`Claude CLI exited with code ${code}`));
+          } else {
+            res();
+          }
+        });
+      });
+
+      const rl = createInterface({ input: child.stdout });
+
+      for await (const line of rl) {
+        if (processError) throw processError;
+        if (!line.trim()) continue;
+        try {
+          const message = JSON.parse(line) as SDKMessage;
+          if (message.type === 'system' && (message as any).subtype === 'init') {
+            if (session) {
+              session.sessionId = (message as any).session_id;
+              this.logger.info('Session initialized', {
+                sessionId: (message as any).session_id,
+                model: (message as any).model,
+                tools: (message as any).tools?.length || 0,
+              });
+            }
+          }
+          yield message;
+        } catch {
+          // Non-JSON line (e.g. debug output), skip
         }
-        yield message;
       }
+
+      await processExitPromise;
     } catch (error) {
-      this.logger.error('Error in Claude query', error);
+      this.logger.error('Error in Claude CLI', error);
       throw error;
+    } finally {
+      ctrl.signal.removeEventListener('abort', cleanup);
     }
   }
 
