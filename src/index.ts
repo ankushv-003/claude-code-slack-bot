@@ -16,6 +16,10 @@ async function start() {
       debug: config.debug,
       useBedrock: config.claude.useBedrock,
       useVertex: config.claude.useVertex,
+      model: config.claude.model || '(not set)',
+      ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '(not set — will use api.anthropic.com)',
+      ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN ? '(set)' : '(not set)',
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ? '(set)' : '(not set)',
     });
 
     // Initialize Slack app
