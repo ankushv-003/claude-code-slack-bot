@@ -302,13 +302,19 @@ export class SlackHandler {
             }
           }
         } else if (message.type === 'result') {
-          this.logger.info('Received result from Claude SDK', {
+          const isError = (message as any).is_error;
+          this.logger.info('Received result from Claude CLI', {
             subtype: message.subtype,
-            hasResult: message.subtype === 'success' && !!(message as any).result,
+            is_error: isError,
+            hasResult: !!(message as any).result,
             totalCost: (message as any).total_cost_usd,
             duration: (message as any).duration_ms,
           });
-          
+
+          if (isError) {
+            throw new Error((message as any).result || 'Claude CLI returned an error');
+          }
+
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
