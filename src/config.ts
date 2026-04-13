@@ -17,7 +17,7 @@ export const config = {
     model: process.env.CLAUDE_MODEL || undefined,
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
-  debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
+  debug: !!process.env.DEBUG || process.env.NODE_ENV === 'development',
 };
 
 export function validateConfig() {

@@ -105,9 +105,12 @@ export class ClaudeHandler {
       cliPath = join(process.cwd(), 'node_modules/@anthropic-ai/claude-code/cli.js');
     }
 
-    this.logger.debug('Spawning Claude CLI', {
+    this.logger.info('Spawning Claude CLI', {
       cliPath,
-      model: config.claude.model,
+      model: config.claude.model || '(default)',
+      baseURL: process.env.ANTHROPIC_BASE_URL || '(default: api.anthropic.com)',
+      authToken: process.env.ANTHROPIC_AUTH_TOKEN ? '(set)' : '(not set)',
+      apiKey: process.env.ANTHROPIC_API_KEY ? '(set)' : '(not set)',
       workingDirectory,
       hasSlackContext: !!slackContext,
       mcpServerCount: Object.keys(allMcpServers).length,
@@ -122,11 +125,10 @@ export class ClaudeHandler {
 
     child.stdin.end();
 
-    if (process.env.DEBUG) {
-      child.stderr.on('data', (data: Buffer) => {
-        this.logger.debug('Claude CLI stderr', data.toString());
-      });
-    }
+    // Always pipe stderr so errors are visible
+    child.stderr.on('data', (data: Buffer) => {
+      this.logger.info('Claude CLI stderr', data.toString().trim());
+    });
 
     const cleanup = () => {
       if (!child.killed) child.kill('SIGTERM');
